@@ -58,6 +58,21 @@ jobs:
           echo "jenkins_job=$(yq  '.jenkins_job  // "pipeline"' pipeline.config.yml)" >> $GITHUB_OUTPUT
           echo "project_name=$(yq '.project_name // "app"'     pipeline.config.yml)" >> $GITHUB_OUTPUT
 
+      - name: Validare Jenkins obligatoriu
+        run: |
+          mode=$(yq '.jenkins_mode // "none"' pipeline.config.yml)
+          if [ "$mode" = "none" ]; then
+            echo "ERROR: jenkins_mode este 'none'. Jenkins este obligatoriu."
+            echo "Setează jenkins_mode la 'docker' sau 'external' în pipeline.config.yml."
+            exit 1
+          fi
+          url=$(yq '.jenkins_url // ""' pipeline.config.yml)
+          if [ -z "$url" ] || [ "$url" = "null" ]; then
+            echo "ERROR: jenkins_url nu este setat în pipeline.config.yml."
+            echo "Exemplu: jenkins_url: \"http://123.456.78.90:8080\""
+            exit 1
+          fi
+
   # ── MDSSC Scan — rulează MEREU ────────────────────────────────────────────
   mdssc-scan:
     name: MDSSC Scan (OPSWAT)
@@ -85,6 +100,8 @@ jobs:
           MDSSC_API_KEY: ${{ secrets.MDSSC_API_KEY }}
         run: |
           set -e
+          THRESHOLD=$(yq '.mdssc_threshold // "critical"' pipeline.config.yml)
+
           mkdir -p /tmp/mdssc-src
           rsync -a \
             --exclude='.git' \
@@ -99,19 +116,18 @@ jobs:
             -e MDSSC_SERVER="$MDSSC_SERVER" \
             -e MDSSC_API_KEY="$MDSSC_API_KEY" \
             -e FAIL_ON_VULNERABILITIES="true" \
-            -e VULNERABILITY_THRESHOLD="high" \
+            -e VULNERABILITY_THRESHOLD="$THRESHOLD" \
             -e SCAN_TIMEOUT="900" \
             -v /tmp/mdssc-src:/scan \
             opswat/mdssc-scanner:latest
 
-  # ── Jenkins trigger — DOAR pe main, DOAR dacă jenkins_mode != none ────────
+  # ── Jenkins trigger — DOAR pe main ───────────────────────────────────────
   deploy:
     name: Jenkins (MDSSC + Build + Deploy)
     needs: [mdssc-scan, read-config]
     if: >-
-      (github.event_name == 'workflow_dispatch' ||
-       (github.event_name == 'push' && github.ref == 'refs/heads/main')) &&
-      needs.read-config.outputs.jenkins_mode != 'none'
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -177,40 +193,11 @@ jobs:
           done
           echo "ERROR: Timeout după ${JENKINS_TIMEOUT_MIN} minute"; exit 1
 
-  # ── Deploy direct (fără Jenkins) — DOAR dacă jenkins_mode = none ──────────
-  deploy-direct:
-    name: Deploy Direct (fără Jenkins)
-    needs: [mdssc-scan, read-config]
-    if: >-
-      (github.event_name == 'workflow_dispatch' ||
-       (github.event_name == 'push' && github.ref == 'refs/heads/main')) &&
-      needs.read-config.outputs.jenkins_mode == 'none'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Deploy (SSH pe VPS)
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_USER: ${{ secrets.VPS_USER }}
-          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
-        run: |
-          echo "Deploy direct pe VPS (fără Jenkins)."
-          echo "Configurează VPS_HOST, VPS_USER, VPS_SSH_KEY în GitHub Secrets."
-          # Exemplu de deploy via SSH:
-          # echo "$VPS_SSH_KEY" > /tmp/key && chmod 600 /tmp/key
-          # ssh -i /tmp/key -o StrictHostKeyChecking=no "$VPS_USER@$VPS_HOST" "cd /app && git pull && pm2 restart all"
-
   # ── E2E Tests ─────────────────────────────────────────────────────────────
   e2e:
     name: E2E Tests (Playwright)
-    needs: [deploy, deploy-direct]
-    if: always() && (needs.deploy.result == 'success' || needs.deploy-direct.result == 'success')
+    needs: [deploy]
+    if: always() && needs.deploy.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:

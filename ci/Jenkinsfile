@@ -73,7 +73,6 @@ pipeline {
                     echo "Deploy      : ${cfg.deploy_method}"
                     echo "Jenkins Mode: ${cfg.jenkins_mode}"
                     echo "MDSSC Thresh: ${cfg.mdssc_threshold}"
-                    echo "Scan Type   : ${cfg.mdssc_scan_type}"
 
                     // Suprascrie threshold din config dacă nu e setat în parametri
                     if (!params.MDSSC_VULNERABILITY_THRESHOLD || params.MDSSC_VULNERABILITY_THRESHOLD == 'none') {
@@ -171,7 +170,7 @@ pipeline {
         // ----------------------------------------------------------
         stage('MDSSC Source Code Scan') {
             when {
-                expression { return params.RUN_REPO_SCAN && cfg.mdssc_scan_type in ['indirect', 'both'] }
+                expression { return params.RUN_REPO_SCAN }
             }
             steps {
                 script {
@@ -260,7 +259,7 @@ pipeline {
         // ----------------------------------------------------------
         stage('Artifact Scan') {
             when {
-                expression { return params.RUN_ARTIFACT_SCAN && cfg.mdssc_scan_type in ['direct', 'both'] }
+                expression { return params.RUN_ARTIFACT_SCAN }
             }
             steps {
                 script {

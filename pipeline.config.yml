@@ -15,13 +15,12 @@ build_output: "dist/"
 app_port: 3000
 
 # ── Jenkins ───────────────────────────────────────────────────────────────────
-# Alege modul în funcție de infrastructura ta:
-#   "none"     → doar GitHub Actions, zero infrastructură necesară
+# Jenkins este obligatoriu. Alege modul în funcție de infrastructura ta:
 #   "docker"   → Jenkins local via Docker (bun pentru demo/dev)
 #   "external" → Jenkins pe VPS propriu (recomandat pentru producție)
-jenkins_mode: "none"
+jenkins_mode: "docker"
 
-# Adresa unde va fi accesibil Jenkins (completează doar dacă jenkins_mode != none)
+# Adresa unde va fi accesibil Jenkins
 # Exemple:
 #   "http://localhost:8080"       → local
 #   "http://123.456.78.90:8080"   → VPS cu IP
@@ -43,8 +42,3 @@ deploy_method: "pm2"
 #   "critical" | "high" | "medium" | "low"
 mdssc_threshold: "critical"
 
-# Tipul de scanare:
-#   "direct"   → arhivă zip/tar trimisă la MDSSC
-#   "indirect" → MDSSC citește direct din Git
-#   "both"     → ambele (recomandat)
-mdssc_scan_type: "both"
