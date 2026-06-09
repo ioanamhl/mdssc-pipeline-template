@@ -37,16 +37,17 @@ header() {
 read_config() {
   local key="$1"
   local default="${2:-}"
-  if command -v yq &>/dev/null && [ -f "pipeline.config.yml" ]; then
+  if [ ! -f "pipeline.config.yml" ]; then echo "$default"; return; fi
+
+  if command -v yq &>/dev/null; then
     local val
     val=$(yq ".${key}" pipeline.config.yml 2>/dev/null || echo "")
-    if [ -z "$val" ] || [ "$val" = "null" ]; then
-      echo "$default"
-    else
-      echo "$val"
-    fi
+    if [ -z "$val" ] || [ "$val" = "null" ]; then echo "$default"; else echo "$val"; fi
   else
-    echo "$default"
+    # fallback: grep simplu pentru valori scalare (fără yq)
+    local val
+    val=$(grep -E "^${key}:" pipeline.config.yml 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '"' | tr -d "'")
+    if [ -z "$val" ] || [ "$val" = "null" ]; then echo "$default"; else echo "$val"; fi
   fi
 }
 
@@ -147,11 +148,99 @@ wait_for_jenkins() {
   log_ok "Jenkins este online!"
 }
 
+# ── Configurare securitate Jenkins ───────────────────────────────────────────
+setup_jenkins_security() {
+  local PORT="$1"
+  local CREDENTIALS_FILE="$2"
+
+  log_step "Configurare securitate Jenkins (creare user admin + API token)"
+
+  # Generează parolă aleatoare
+  local ADMIN_PASS
+  ADMIN_PASS=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 16) || \
+    ADMIN_PASS="Admin$(date +%H%M%S)"
+
+  # Script Groovy: creare user admin + activare security
+  local groovy_script="
+import jenkins.model.*
+import hudson.security.*
+def instance = Jenkins.getInstance()
+if (!(instance.getSecurityRealm() instanceof HudsonPrivateSecurityRealm)) {
+  def realm = new HudsonPrivateSecurityRealm(false)
+  realm.createAccount('admin', '${ADMIN_PASS}')
+  instance.setSecurityRealm(realm)
+  def strategy = new FullControlOnceLoggedInAuthorizationStrategy()
+  strategy.setAllowAnonymousRead(false)
+  instance.setAuthorizationStrategy(strategy)
+  instance.save()
+  println 'Security configured successfully'
+} else {
+  println 'Security already configured'
+}
+"
+
+  # CSRF crumb fără autentificare (Jenkins e încă nesecurizat)
+  local cookie_jar="/tmp/jenkins-sec-$$.txt"
+  local crumb_json CRUMB_VALUE CRUMB_FIELD
+  crumb_json=$(curl -sf --cookie-jar "$cookie_jar" \
+    "http://localhost:${PORT}/crumbIssuer/api/json" 2>/dev/null || echo "")
+  CRUMB_VALUE=$(echo "$crumb_json" | grep -o '"crumb":"[^"]*"'             | sed 's/"crumb":"//;s/"//')
+  CRUMB_FIELD=$(echo "$crumb_json" | grep -o '"crumbRequestField":"[^"]*"' | sed 's/"crumbRequestField":"//;s/"//')
+  CRUMB_FIELD="${CRUMB_FIELD:-Jenkins-Crumb}"
+
+  # Rulează scriptul Groovy via Script Console
+  local script_result
+  script_result=$(curl -s --cookie "$cookie_jar" \
+    -H "${CRUMB_FIELD}: ${CRUMB_VALUE}" \
+    -X POST "http://localhost:${PORT}/scriptText" \
+    --data-urlencode "script=${groovy_script}" 2>/dev/null)
+
+  if echo "$script_result" | grep -q "configured"; then
+    log_ok "User 'admin' creat și securitatea activată"
+  else
+    log_warn "Security setup răspuns: ${script_result:-no response}"
+  fi
+
+  sleep 3
+
+  # Generează API token cu admin autentificat
+  crumb_json=$(curl -sf -u "admin:${ADMIN_PASS}" --cookie-jar "$cookie_jar" \
+    "http://localhost:${PORT}/crumbIssuer/api/json" 2>/dev/null || echo "")
+  CRUMB_VALUE=$(echo "$crumb_json" | grep -o '"crumb":"[^"]*"'             | sed 's/"crumb":"//;s/"//')
+  CRUMB_FIELD=$(echo "$crumb_json" | grep -o '"crumbRequestField":"[^"]*"' | sed 's/"crumbRequestField":"//;s/"//')
+  CRUMB_FIELD="${CRUMB_FIELD:-Jenkins-Crumb}"
+
+  local token_response
+  token_response=$(curl -s -u "admin:${ADMIN_PASS}" --cookie "$cookie_jar" \
+    -H "${CRUMB_FIELD}: ${CRUMB_VALUE}" \
+    -X POST "http://localhost:${PORT}/user/admin/descriptorByName/jenkins.security.ApiTokenProperty/generateNewToken" \
+    --data "newTokenName=gh-actions-token" 2>/dev/null)
+
+  local API_TOKEN
+  API_TOKEN=$(echo "$token_response" | grep -o '"tokenValue":"[^"]*"' | sed 's/"tokenValue":"//;s/"//')
+
+  rm -f "$cookie_jar"
+
+  # Salvează credențialele în Jenkins home (volum persistent)
+  {
+    echo "JENKINS_USER=admin"
+    echo "JENKINS_PASSWORD=${ADMIN_PASS}"
+    echo "JENKINS_API_TOKEN=${API_TOKEN}"
+  } > "$CREDENTIALS_FILE"
+
+  log_ok "Credențiale salvate în: ${CREDENTIALS_FILE}"
+
+  # Exportă pentru utilizare în restul scriptului
+  JENKINS_ADMIN_PASSWORD="$ADMIN_PASS"
+  JENKINS_ADMIN_TOKEN="$API_TOKEN"
+}
+
 # ── Creare job Jenkins ────────────────────────────────────────────────────────
 create_jenkins_job() {
   local PORT="$1"
   local GITHUB_REPO="$2"
   local JOB_NAME="$3"
+  local PASSWORD="${4:-}"
 
   cat > /tmp/jenkins-job.xml << XMLEOF
 <?xml version='1.1' encoding='UTF-8'?>
@@ -187,15 +276,48 @@ create_jenkins_job() {
 </flow-definition>
 XMLEOF
 
-  if curl -sf -X POST \
-    "http://localhost:${PORT}/createItem?name=${JOB_NAME}" \
-    --header "Content-Type: application/xml" \
-    --data-binary @/tmp/jenkins-job.xml \
-    2>/dev/null; then
+  local AUTH_FLAG=""
+  [ -n "$PASSWORD" ] && AUTH_FLAG="-u admin:${PASSWORD}"
+
+  local cookie_jar="/tmp/jenkins-cookies-$$.txt"
+  local resp_file="/tmp/jenkins-create-resp-$$.txt"
+
+  # Obține CSRF crumb și salvează cookie-ul de sesiune
+  local crumb_json CRUMB_VALUE CRUMB_FIELD
+  # shellcheck disable=SC2086
+  crumb_json=$(curl -sf $AUTH_FLAG \
+    --cookie-jar "$cookie_jar" \
+    "http://localhost:${PORT}/crumbIssuer/api/json" 2>/dev/null || echo "")
+  CRUMB_VALUE=$(echo "$crumb_json" | grep -o '"crumb":"[^"]*"'             | sed 's/"crumb":"//;s/"//')
+  CRUMB_FIELD=$(echo "$crumb_json" | grep -o '"crumbRequestField":"[^"]*"' | sed 's/"crumbRequestField":"//;s/"//')
+  CRUMB_FIELD="${CRUMB_FIELD:-Jenkins-Crumb}"
+  log_info "CSRF crumb: ${CRUMB_VALUE:-(none)}"
+
+  local http_code
+  if [ -n "$CRUMB_VALUE" ]; then
+    # shellcheck disable=SC2086
+    http_code=$(curl -s -w '%{http_code}' -o "$resp_file" -X POST $AUTH_FLAG \
+      --cookie "$cookie_jar" \
+      -H "${CRUMB_FIELD}: ${CRUMB_VALUE}" \
+      -H "Content-Type: application/xml" \
+      --data-binary "@/tmp/jenkins-job.xml" \
+      "http://localhost:${PORT}/createItem?name=${JOB_NAME}")
+  else
+    # shellcheck disable=SC2086
+    http_code=$(curl -s -w '%{http_code}' -o "$resp_file" -X POST $AUTH_FLAG \
+      -H "Content-Type: application/xml" \
+      --data-binary "@/tmp/jenkins-job.xml" \
+      "http://localhost:${PORT}/createItem?name=${JOB_NAME}")
+  fi
+
+  log_info "Jenkins createItem → HTTP ${http_code}"
+  if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
     log_ok "Job '${JOB_NAME}' creat în Jenkins"
   else
-    log_warn "Job-ul nu a putut fi creat automat — creează-l manual din UI"
+    log_error "Creare job eșuată (HTTP ${http_code}):"
+    cat "$resp_file" 2>/dev/null | head -20 || true
   fi
+  rm -f "$cookie_jar" "$resp_file"
 }
 
 # ── Instalare via Docker ──────────────────────────────────────────────────────
@@ -207,6 +329,7 @@ install_docker_mode() {
   JENKINS_URL=$(read_config "jenkins_url" "http://localhost:${JENKINS_PORT}")
   GITHUB_REPO=$(read_config "github_repo" "")
   JOB_NAME=$(read_config "jenkins_job" "${PROJECT_NAME}-pipeline")
+  APP_PORT=$(read_config "app_port" "3001")
 
   # Extrage host-ul din jenkins_url
   JENKINS_HOST=$(echo "$JENKINS_URL" | sed 's|http[s]*://||' | cut -d: -f1 | cut -d/ -f1)
@@ -243,32 +366,48 @@ install_docker_mode() {
       log_ok "Container vechi șters"
     else
       log_info "Folosesc containerul existent."
-      show_final_info "$JENKINS_URL" "$JENKINS_PORT" "$JOB_NAME" ""
+      local CREDS_FILE="${JENKINS_HOME}/jenkins-credentials.txt"
+      if [ -f "$CREDS_FILE" ]; then
+        JENKINS_ADMIN_PASSWORD=$(grep "JENKINS_PASSWORD=" "$CREDS_FILE" | cut -d= -f2)
+        JENKINS_ADMIN_TOKEN=$(grep "JENKINS_API_TOKEN=" "$CREDS_FILE" | cut -d= -f2)
+        log_ok "Credențiale citite din: ${CREDS_FILE}"
+      else
+        setup_jenkins_security "$JENKINS_PORT" "$CREDS_FILE"
+      fi
+      if [ -n "$GITHUB_REPO" ]; then
+        log_step "Creare job Jenkins"
+        create_jenkins_job "$JENKINS_PORT" "$GITHUB_REPO" "$JOB_NAME" "${JENKINS_ADMIN_PASSWORD:-}"
+      fi
+      show_final_info "$JENKINS_URL" "$JENKINS_PORT" "$JOB_NAME" "${JENKINS_ADMIN_PASSWORD:-}" "${JENKINS_ADMIN_TOKEN:-}"
       return
     fi
   fi
 
   # Pornire Jenkins
   log_step "Pornire container Jenkins"
+  FRONTEND_PORT=$((APP_PORT + 1))
   docker run -d \
     --name "jenkins-${PROJECT_NAME}" \
     --restart unless-stopped \
     -p "${JENKINS_PORT}:8080" \
     -p "50000:50000" \
+    -p "${APP_PORT}:${APP_PORT}" \
+    -p "${FRONTEND_PORT}:${FRONTEND_PORT}" \
     -v "${JENKINS_HOME}:/var/jenkins_home" \
-    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v //var/run/docker.sock://var/run/docker.sock \
     -e JAVA_OPTS="-Djenkins.install.runSetupWizard=false" \
     --user root \
-    jenkins/jenkins:lts-jdk17 > /dev/null
+    jenkins/jenkins:lts-jdk21 > /dev/null
   log_ok "Container Jenkins pornit"
 
   wait_for_jenkins "$JENKINS_PORT"
 
   # Instalare plugin-uri
   log_step "Instalare plugin-uri Jenkins (${#JENKINS_PLUGINS[@]} plugin-uri)"
+  local PLUGINS_STR="${JENKINS_PLUGINS[*]}"
   docker exec "jenkins-${PROJECT_NAME}" \
-    jenkins-plugin-cli --plugins "${JENKINS_PLUGINS[@]}" 2>&1 | \
-    grep -E "^(Installing|Done|Error)" || true
+    jenkins-plugin-cli --plugins "$PLUGINS_STR" 2>&1 | \
+    grep -E "(Installing|Done|Error|successfully|failed)" || true
 
   log_info "Restart Jenkins pentru activare plugin-uri..."
   docker restart "jenkins-${PROJECT_NAME}" > /dev/null
@@ -276,15 +415,27 @@ install_docker_mode() {
   wait_for_jenkins "$JENKINS_PORT"
   log_ok "Plugin-uri instalate"
 
+  # Instalare Node.js 20 și PM2 în container (necesar pentru build + deploy)
+  log_step "Instalare Node.js 20 și PM2 în container Jenkins"
+  docker exec "jenkins-${PROJECT_NAME}" bash -c "
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && npm install -g pm2"
+  log_ok "Node.js $(docker exec jenkins-${PROJECT_NAME} node --version) și PM2 instalate"
+
+  # Configurare securitate: creare user admin + generare API token
+  local CREDS_FILE="${JENKINS_HOME}/jenkins-credentials.txt"
+  setup_jenkins_security "$JENKINS_PORT" "$CREDS_FILE"
+
   # Creare job
   if [ -n "$GITHUB_REPO" ]; then
     log_step "Creare job Jenkins"
-    create_jenkins_job "$JENKINS_PORT" "$GITHUB_REPO" "$JOB_NAME"
+    create_jenkins_job "$JENKINS_PORT" "$GITHUB_REPO" "$JOB_NAME" "${JENKINS_ADMIN_PASSWORD:-}"
   else
     log_warn "github_repo nu e setat în pipeline.config.yml — job-ul Jenkins trebuie creat manual"
   fi
 
-  show_final_info "$JENKINS_URL" "$JENKINS_PORT" "$JOB_NAME" ""
+  show_final_info "$JENKINS_URL" "$JENKINS_PORT" "$JOB_NAME" "${JENKINS_ADMIN_PASSWORD:-}" "${JENKINS_ADMIN_TOKEN:-}"
 }
 
 # ── Instalare nativă Linux ────────────────────────────────────────────────────
@@ -361,7 +512,7 @@ install_linux_mode() {
   # Creare job
   if [ -n "$GITHUB_REPO" ]; then
     log_step "Creare job Jenkins"
-    create_jenkins_job "$JENKINS_PORT" "$GITHUB_REPO" "$JOB_NAME"
+    create_jenkins_job "$JENKINS_PORT" "$GITHUB_REPO" "$JOB_NAME" "$INITIAL_PASSWORD"
   fi
 
   show_final_info "$JENKINS_URL" "$JENKINS_PORT" "$JOB_NAME" "$INITIAL_PASSWORD"
@@ -373,6 +524,7 @@ show_final_info() {
   local JENKINS_PORT="$2"
   local JOB_NAME="$3"
   local INITIAL_PASSWORD="$4"
+  local API_TOKEN="${5:-}"
 
   echo ""
   echo -e "${BOLD}${GREEN}============================================================${NC}"
@@ -383,7 +535,13 @@ show_final_info() {
   echo -e "  ${BOLD}Job creat:${NC}     ${JOB_NAME}"
   echo ""
   if [ -n "$INITIAL_PASSWORD" ]; then
-    echo -e "  ${BOLD}${YELLOW}Parolă inițială admin:${NC} ${INITIAL_PASSWORD}"
+    echo -e "  ${BOLD}${YELLOW}User Jenkins:${NC}          admin"
+    echo -e "  ${BOLD}${YELLOW}Parolă Jenkins:${NC}        ${INITIAL_PASSWORD}"
+    echo ""
+  fi
+  if [ -n "$API_TOKEN" ]; then
+    echo -e "  ${BOLD}${YELLOW}JENKINS_API_TOKEN:${NC}     ${API_TOKEN}"
+    echo -e "  ${CYAN}→ Adaugă direct ca secret GitHub: JENKINS_API_TOKEN${NC}"
     echo ""
   fi
   echo -e "  ${BOLD}Pași următori:${NC}"

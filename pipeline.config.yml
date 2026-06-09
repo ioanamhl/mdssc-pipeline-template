@@ -5,14 +5,14 @@
 # =============================================================================
 
 # ── Identificare proiect ──────────────────────────────────────────────────────
-project_name: "my-app"
-github_repo: "https://github.com/your-org/your-repo"
+project_name: "my-app"                        # Numele proiectului tău
+github_repo: "https://github.com/user/repo"   # URL-ul repo-ului GitHub
 
 # ── Stack aplicație ───────────────────────────────────────────────────────────
-stack: "node"             # node | python | java | go
+stack: "node"                 # node | python | java | go
 build_command: "npm run build"
-build_output: "dist/"
-app_port: 3000
+build_output: "dist/"         # Directorul generat la build (ex: dist/, build/)
+app_port: 3000                # Portul pe care rulează aplicația
 
 # ── Jenkins ───────────────────────────────────────────────────────────────────
 # Jenkins este obligatoriu. Alege modul în funcție de infrastructura ta:
@@ -20,14 +20,14 @@ app_port: 3000
 #   "external" → Jenkins pe VPS propriu (recomandat pentru producție)
 jenkins_mode: "docker"
 
-# Adresa unde va fi accesibil Jenkins
-# Exemple:
-#   "http://localhost:8080"       → local
-#   "http://123.456.78.90:8080"   → VPS cu IP
-#   "https://jenkins.firma.com"   → domeniu propriu
+# Adresa unde va fi accesibil Jenkins din exterior
+# Completează după ce pornești tunelul (ex: ngrok, cloudflared):
+#   cloudflared tunnel --url http://localhost:8080
+# Exemplu: "https://abc123.ngrok-free.app"
+#           "https://random-words.trycloudflare.com"
 jenkins_url: ""
 jenkins_port: 8080
-jenkins_job: "my-app-pipeline"
+jenkins_job: "my-app-pipeline"   # Numele job-ului din Jenkins (creat automat de setup-jenkins.sh)
 
 # ── Deploy ────────────────────────────────────────────────────────────────────
 # Cum se face deploy-ul după build:
@@ -38,7 +38,10 @@ jenkins_job: "my-app-pipeline"
 deploy_method: "pm2"
 
 # ── MDSSC ─────────────────────────────────────────────────────────────────────
-# Pragul de severitate sub care build-ul e blocat:
-#   "critical" | "high" | "medium" | "low"
-mdssc_threshold: "critical"
-
+# Pragul de severitate sub care build-ul este blocat:
+#   "none"     → scanează și raportează, fără a bloca pipeline-ul
+#   "critical" → blochează doar la vulnerabilități critice
+#   "high"     → blochează la high + critical
+#   "medium"   → blochează la medium + high + critical
+#   "low"      → blochează la orice vulnerabilitate
+mdssc_threshold: "none"
